@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fnmatch
+import io
 import json
 import os
 import platform
@@ -166,7 +167,7 @@ register_folders()
 # =============================================================================
 
 # Kept aligned with the upstream node at the time this MTP edition was made.
-LLAMA_CPP_RELEASE_TAG = "b10472"
+LLAMA_CPP_RELEASE_TAG = "b11396"
 RELEASE_API_URL = (
     "https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/"
     f"{LLAMA_CPP_RELEASE_TAG}"
@@ -443,6 +444,7 @@ LLAMA_SEED_MODULUS = 2**32
 MAX_LLAMA_SEED = LLAMA_SEED_MODULUS - 1
 
 _MTP_HELP_CHECKED: set[str] = set()
+_VIDEO_HELP_CHECKED: set[str] = set()
 
 
 def _tensor_to_temp_png(tensor) -> Path:
@@ -545,12 +547,192 @@ def _ensure_mtp_supported(cli_path: Path) -> None:
     _MTP_HELP_CHECKED.add(key)
 
 
+def _video_to_temp_file(video) -> tuple[Path, bool]:
+    """Resolve a ComfyUI VIDEO input to a filesystem path."""
+    if video is None:
+        raise ValueError("Video input is empty.")
+
+    get_stream_source = getattr(video, "get_stream_source", None)
+    if not callable(get_stream_source):
+        raise TypeError(
+            "The connected video input is not a compatible ComfyUI VIDEO object."
+        )
+
+    source = get_stream_source()
+
+    if isinstance(source, (str, os.PathLike)):
+        path = Path(source)
+        if not path.is_file():
+            raise FileNotFoundError(f"Video file not found: {path}")
+        return path, False
+
+    if isinstance(source, io.BytesIO):
+        source.seek(0)
+        fd, name = tempfile.mkstemp(
+            prefix="llm-text-processor-video-",
+            suffix=".mp4",
+        )
+        os.close(fd)
+        path = Path(name)
+        with path.open("wb") as handle:
+            handle.write(source.read())
+        return path, True
+
+    if hasattr(source, "read"):
+        try:
+            source.seek(0)
+        except Exception:
+            pass
+        fd, name = tempfile.mkstemp(
+            prefix="llm-text-processor-video-",
+            suffix=".mp4",
+        )
+        os.close(fd)
+        path = Path(name)
+        with path.open("wb") as handle:
+            while True:
+                chunk = source.read(1024 * 1024)
+                if not chunk:
+                    break
+                handle.write(chunk)
+        return path, True
+
+    raise TypeError(
+        "Unsupported video stream source returned by ComfyUI VIDEO input."
+    )
+
+
+def _video_ffprobe_path(video_ffmpeg_dir: str) -> str:
+    if video_ffmpeg_dir and str(video_ffmpeg_dir).strip():
+        base = Path(str(video_ffmpeg_dir).strip())
+        candidate = base / ("ffprobe.exe" if os.name == "nt" else "ffprobe")
+        if candidate.is_file():
+            return str(candidate)
+    return "ffprobe.exe" if os.name == "nt" else "ffprobe"
+
+
+def _probe_video_metadata(video_path: Path, video_ffmpeg_dir: str) -> tuple[float | None, float | None]:
+    """Return (duration_seconds, source_fps) when ffprobe is available."""
+    ffprobe = _video_ffprobe_path(video_ffmpeg_dir)
+    command = [
+        ffprobe,
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=avg_frame_rate,duration:format=duration",
+        "-of", "json",
+        str(video_path),
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+            shell=False,
+        )
+        if result.returncode != 0:
+            return None, None
+        data = json.loads(result.stdout or "{}")
+        stream = (data.get("streams") or [{}])[0]
+        fmt = data.get("format") or {}
+
+        duration = stream.get("duration") or fmt.get("duration")
+        duration = float(duration) if duration not in (None, "N/A", "") else None
+
+        fps = None
+        rate = stream.get("avg_frame_rate")
+        if rate and rate != "N/A" and "/" in str(rate):
+            num, den = str(rate).split("/", 1)
+            if float(den) != 0:
+                fps = float(num) / float(den)
+        elif rate not in (None, "N/A", ""):
+            fps = float(rate)
+
+        return duration, fps
+    except Exception:
+        return None, None
+
+
+def _build_video_prompt(prompt: str, duration: float | None, source_fps: float | None) -> str:
+    """Add only video-analysis guidance; normal image/text behavior is unchanged."""
+    metadata = []
+    if duration is not None and duration > 0:
+        metadata.append(f"Verified video duration: {duration:.3f} seconds.")
+    if source_fps is not None and source_fps > 0:
+        metadata.append(f"Original video FPS: {source_fps:.3f}.")
+    metadata.append("Video is sampled for model analysis at exactly 6 FPS.")
+
+    instruction = (
+        "VIDEO ANALYSIS INSTRUCTIONS:\n"
+        + " ".join(metadata)
+        + "\n"
+        "IMPORTANT: The input is ONE CONTINUOUS VIDEO, not a collection of "
+        "independent images. The sampled frames are only temporal observations "
+        "of the same continuous video sequence. Interpret them together in "
+        "chronological order and infer continuous motion, actions, interactions, "
+        "and state changes across time. Never describe the input as a series, "
+        "set, or collection of separate frames or images. Never treat each "
+        "sampled frame as an individual scene.\n"
+        "Describe the video as a continuous temporal sequence of meaningful "
+        "actions and events, not as a frame-by-frame or second-by-second log. "
+        "But do not use the term 'visual sequence' or the like; use only the term 'video'. "
+        "Combine consecutive observations into one time segment whenever the "
+        "same action continues. Create a new timestamp segment only when the "
+        "main action, interaction, or clearly relevant state changes. Do not "
+        "make a segment for every second and do not use fixed one-second "
+        "intervals. Prefer natural segments such as 00:00 - 00:06 and "
+        "00:06 - 00:10. Use the verified video duration above as the hard end "
+        "of the timeline and never invent a longer or shorter total duration. "
+        "Do not estimate duration from the number of sampled frames. Keep "
+        "timestamps chronological and use the actual video time.\n\n"
+        "User request:\n"
+        + str(prompt)
+    )
+    return instruction
+
+
+def _ensure_video_supported(cli_path: Path) -> None:
+    key = str(cli_path.resolve())
+    if key in _VIDEO_HELP_CHECKED:
+        return
+
+    try:
+        result = subprocess.run(
+            [str(cli_path), "--help"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            shell=False,
+        )
+        help_text = (result.stdout or "") + "\n" + (result.stderr or "")
+    except Exception as exc:
+        raise RuntimeError(f"Could not verify video support in llama.cpp: {exc}") from exc
+
+    missing = [flag for flag in ("--video", "--video-fps", "--video-timestamp-interval") if flag not in help_text]
+    if missing:
+        raise RuntimeError(
+            "The installed llama.cpp binary does not advertise native video support. "
+            "Missing options: " + ", ".join(missing)
+        )
+    _VIDEO_HELP_CHECKED.add(key)
+
+
 def build_command(
     model_path: Path,
     mmproj_path: Path | None,
     mtp_path: Path | None,
     system_prompt_path: Path | None,
     image,
+    video,
+    video_ffmpeg_dir: str,
     prompt: str,
     max_tokens: int,
     temperature: float,
@@ -573,6 +755,8 @@ def build_command(
         _ensure_mtp_supported(cli_paths.cli)
 
     image_paths: list[Path] = []
+    video_path: Path | None = None
+    video_prompt = prompt
 
     if image is not None:
         if mmproj_path is None:
@@ -583,7 +767,25 @@ def build_command(
         image_paths = tensor_to_temp_pngs(image)
         cleanup_paths.extend(image_paths)
 
-    prompt_path = _write_prompt_file(prompt)
+    if video is not None:
+        if mmproj_path is None:
+            raise ValueError(
+                "Video input requires a selected mmproj GGUF file."
+            )
+
+        video_path, video_is_temp = _video_to_temp_file(video)
+        if video_is_temp:
+            cleanup_paths.append(video_path)
+
+        _ensure_video_supported(cli_paths.cli)
+        duration, source_fps = _probe_video_metadata(
+            video_path, video_ffmpeg_dir
+        )
+        video_prompt = _build_video_prompt(
+            prompt, duration, source_fps
+        )
+
+    prompt_path = _write_prompt_file(video_prompt)
     cleanup_paths.append(prompt_path)
 
     command = [
@@ -612,12 +814,25 @@ def build_command(
 
     command.extend(["-f", str(prompt_path)])
 
-    if image_paths:
+    if image_paths or video_path is not None:
         command.extend(["--mmproj", str(mmproj_path)])
+
+    if image_paths:
         command.extend([
             "--image",
             ",".join(str(path) for path in image_paths),
         ])
+
+    if video_path is not None:
+        command.extend([
+            "--video", str(video_path),
+            "--video-fps", "6",
+            "--video-timestamp-interval", "0",
+        ])
+        if video_ffmpeg_dir and str(video_ffmpeg_dir).strip():
+            command.extend([
+                "--video-ffmpeg-dir", str(video_ffmpeg_dir).strip()
+            ])
 
     # User advanced args stay available for parameters such as:
     #   --min-p 0.05
@@ -1008,6 +1223,15 @@ class LLMTextProcessor:
                     },
                 ),
 
+                "video": (
+                    "VIDEO",
+                    {
+                        "tooltip": (
+                            "Optional video input. Requires a matching mmproj."
+                        ),
+                    },
+                ),
+
                 "enable_processing": (
                     "BOOLEAN",
                     {
@@ -1032,6 +1256,19 @@ class LLMTextProcessor:
                         ),
                     },
                 ),
+
+                "video_ffmpeg_dir": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": False,
+                        "tooltip": (
+                            "Optional directory containing ffmpeg.exe and "
+                            "ffprobe.exe. Leave empty to use PATH."
+                        ),
+                        "advanced": True,
+                    },
+                ),
             },
         }
 
@@ -1046,7 +1283,7 @@ class LLMTextProcessor:
 
     FUNCTION = "generate"
     CATEGORY = "LLM Text Processor"
-    TITLE = "LLM Text Processor + MTP"
+    TITLE = "LLM Text Processor ++"
 
     @classmethod
     def VALIDATE_INPUTS(
@@ -1079,6 +1316,8 @@ class LLMTextProcessor:
         timeout_seconds: int,
         reasoning: str,
         image=None,
+        video=None,
+        video_ffmpeg_dir: str = "",
         enable_processing: bool = True,
         extra_args: str = "",
     ):
@@ -1117,6 +1356,8 @@ class LLMTextProcessor:
             mtp_path=mtp_path,
             system_prompt_path=system_prompt_path,
             image=image,
+            video=video,
+            video_ffmpeg_dir=video_ffmpeg_dir,
             prompt=prompt,
             max_tokens=max_tokens,
             temperature=temperature,
@@ -1146,5 +1387,5 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "LLMTextProcessor": "LLM Text Processor + MTP",
+    "LLMTextProcessor": "LLM Text Processor ++",
 }
